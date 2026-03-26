@@ -1,0 +1,13 @@
+.DS_Store
+.venv/
+.secrets/
+__pycache__/
+*.pyc
+
+secret.json
+client_secret*.json
+
+library/
+output/
+
+dabbleverse.egg-info/
