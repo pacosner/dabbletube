@@ -7,6 +7,8 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Event, Thread
+from time import perf_counter
 from urllib.parse import urlparse
 from typing import Any
 
@@ -41,6 +43,43 @@ class AddedVideoRecord:
     channel_title: str
     channel_input: str
     upload_date: str | None
+
+
+def log(message: str) -> None:
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
+class YtDlpLogger:
+    def debug(self, message: str) -> None:
+        normalized = (message or "").strip()
+        if not normalized:
+            return
+        if normalized.startswith("[youtube]") or normalized.startswith("[download]") or normalized.startswith("[info]"):
+            log(f"yt-dlp: {normalized}")
+
+    def warning(self, message: str) -> None:
+        normalized = (message or "").strip()
+        if normalized:
+            log(f"yt-dlp warning: {normalized}")
+
+    def error(self, message: str) -> None:
+        normalized = (message or "").strip()
+        if normalized:
+            log(f"yt-dlp error: {normalized}")
+
+
+def start_progress_watch(label: str, interval_seconds: float = 15.0) -> tuple[Event, Thread]:
+    stop_event = Event()
+
+    def watch() -> None:
+        started_at = perf_counter()
+        while not stop_event.wait(interval_seconds):
+            log(f"Still working on {label}... {perf_counter() - started_at:.1f}s elapsed")
+
+    thread = Thread(target=watch, daemon=True)
+    thread.start()
+    return stop_event, thread
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,13 +122,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shuffle-seed",
         type=int,
-        help="Optional random seed for reproducible playlist shuffling.",
+        help="Optional random seed to enable reproducible playlist shuffling.",
     )
     parser.add_argument(
         "--request-sleep",
         type=float,
         default=1.5,
         help="Seconds to sleep between YouTube requests to reduce rate limiting. Defaults to 1.5.",
+    )
+    parser.add_argument(
+        "--socket-timeout",
+        type=float,
+        default=30.0,
+        help="Network socket timeout in seconds for yt-dlp requests. Defaults to 30.",
+    )
+    parser.add_argument(
+        "--cookies",
+        type=Path,
+        help="Path to a Netscape-format cookies file to pass through to yt-dlp.",
+    )
+    parser.add_argument(
+        "--cookies-from-browser",
+        help="Browser name to import cookies from for yt-dlp, for example chrome, firefox, safari, or edge.",
     )
     parser.add_argument(
         "--audio-only",
@@ -215,18 +269,26 @@ def should_download_media(args: argparse.Namespace) -> bool:
 
 
 def make_ydl_opts(args: argparse.Namespace, library_dir: Path, download_media: bool) -> dict[str, Any]:
-    format_selector = "bestaudio/best" if args.audio_only else "bv*+ba/b"
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "extract_flat": False,
+        "extract_flat": "in_playlist" if not download_media else False,
         "outtmpl": str(library_dir / "%(uploader)s" / "%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"),
-        "format": format_selector,
         "restrictfilenames": False,
         "windowsfilenames": False,
         "sleep_interval_requests": args.request_sleep,
+        "socket_timeout": args.socket_timeout,
+        "logger": YtDlpLogger(),
     }
+    if args.limit and args.limit > 0:
+        opts["playlistend"] = args.limit
+    if args.cookies:
+        opts["cookiefile"] = str(args.cookies)
+    if args.cookies_from_browser:
+        opts["cookiesfrombrowser"] = (args.cookies_from_browser,)
+    if download_media:
+        opts["format"] = "bestaudio/best" if args.audio_only else "bv*+ba/b"
     if args.audio_only and download_media:
         opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
     if args.archive_file:
@@ -238,8 +300,15 @@ def make_ydl_opts(args: argparse.Namespace, library_dir: Path, download_media: b
 
 
 def collect_channel_records(channel_input: str, ydl: YoutubeDL, download_media: bool) -> list[VideoRecord]:
-    info = ydl.extract_info(channel_input, download=download_media)
+    started_at = perf_counter()
+    stop_event, watch_thread = start_progress_watch(f"channel extraction for {channel_input}")
+    try:
+        info = ydl.extract_info(channel_input, download=download_media)
+    finally:
+        stop_event.set()
+        watch_thread.join(timeout=0.1)
     if not info:
+        log(f"Finished {channel_input}: no videos returned in {perf_counter() - started_at:.1f}s")
         return []
 
     entries = info.get("entries") or [info]
@@ -273,6 +342,10 @@ def collect_channel_records(channel_input: str, ydl: YoutubeDL, download_media: 
                 extractor=entry.get("extractor_key") or entry.get("extractor"),
             )
         )
+    channel_title = info.get("title") or channel_input
+    log(
+        f"Finished {channel_title}: collected {len(records)} records in {perf_counter() - started_at:.1f}s"
+    )
     return records
 
 
@@ -287,6 +360,10 @@ def coerce_iso_datetime(entry: dict[str, Any]) -> str | None:
 
 
 def sort_records(records: list[VideoRecord]) -> list[VideoRecord]:
+    return list(records)
+
+
+def sort_records_by_upload_date(records: list[VideoRecord]) -> list[VideoRecord]:
     def sort_key(record: VideoRecord) -> tuple[int, int, str]:
         primary = int(record.upload_date) if record.upload_date and record.upload_date.isdigit() else 0
         missing = 1 if primary == 0 else 0
@@ -316,6 +393,8 @@ def dedupe_records(records: list[VideoRecord]) -> list[VideoRecord]:
 
 
 def shuffle_records(records: list[VideoRecord], seed: int | None) -> list[VideoRecord]:
+    if seed is None:
+        return list(records)
     shuffled = list(records)
     rng = random.Random(seed)
     rng.shuffle(shuffled)
@@ -405,8 +484,11 @@ def require_youtube_args(args: argparse.Namespace) -> None:
 def clear_existing_playlist(youtube: Any, playlist_id: str) -> int:
     removed = 0
     next_page_token: str | None = None
+    page = 0
 
     while True:
+        page += 1
+        log(f"Loading playlist page {page} to clear existing items...")
         response = (
             youtube.playlistItems()
             .list(
@@ -419,12 +501,15 @@ def clear_existing_playlist(youtube: Any, playlist_id: str) -> int:
         )
 
         items = response.get("items", [])
+        log(f"Clearing {len(items)} items from playlist page {page}...")
         for item in items:
             playlist_item_id = item.get("id")
             if not playlist_item_id:
                 continue
             youtube.playlistItems().delete(id=playlist_item_id).execute()
             removed += 1
+            if removed % 25 == 0:
+                log(f"Removed {removed} existing playlist items so far...")
 
         next_page_token = response.get("nextPageToken")
         if not next_page_token:
@@ -436,8 +521,11 @@ def clear_existing_playlist(youtube: Any, playlist_id: str) -> int:
 def get_existing_playlist_video_ids(youtube: Any, playlist_id: str) -> set[str]:
     existing_video_ids: set[str] = set()
     next_page_token: str | None = None
+    page = 0
 
     while True:
+        page += 1
+        log(f"Loading existing playlist items page {page}...")
         response = (
             youtube.playlistItems()
             .list(
@@ -455,6 +543,7 @@ def get_existing_playlist_video_ids(youtube: Any, playlist_id: str) -> set[str]:
             video_id = resource_id.get("videoId")
             if video_id:
                 existing_video_ids.add(video_id)
+        log(f"Loaded {len(existing_video_ids)} existing playlist videos so far...")
 
         next_page_token = response.get("nextPageToken")
         if not next_page_token:
@@ -512,8 +601,15 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
     skipped_videos: list[dict[str, str]] = []
     already_present_video_ids: list[str] = []
     records_with_ids = [record for record in records if record.video_id]
-    total = len(records_with_ids)
-    for index, record in enumerate(records_with_ids, start=1):
+    if args.youtube_create_playlist or args.youtube_replace_existing:
+        records_to_add = sort_records_by_upload_date(records_with_ids)
+        log("Using upload-date order for full playlist creation/rebuild, newest first.")
+    else:
+        records_to_add = list(reversed(records_with_ids))
+        log("Using added-order upload for incremental sync, newest additions first.")
+    total = len(records_to_add)
+    log(f"Preparing to add {total} videos with valid IDs to YouTube playlist...")
+    for index, record in enumerate(records_to_add, start=1):
         if not is_valid_video_id(record.video_id):
             print(f"Skipping invalid video ID for: {record.title}", flush=True)
             skipped_videos.append(
@@ -532,6 +628,7 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
                     body={
                         "snippet": {
                             "playlistId": playlist_id,
+                            "position": 0,
                             "resourceId": {"kind": "youtube#video", "videoId": record.video_id},
                         }
                     },
@@ -558,6 +655,8 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
                 upload_date=record.upload_date,
             )
         )
+        if index % 25 == 0 or index == total:
+            log(f"YouTube playlist progress: processed {index}/{total}, added {len(added_video_ids)}")
 
     return {
         "youtube_playlist_id": playlist_id,
@@ -576,9 +675,23 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
 
 
 def main() -> int:
+    run_started_at = perf_counter()
     args = parse_args()
     channels = load_channels(args)
     download_media = should_download_media(args)
+
+    log(
+        f"Starting dabbleverse with {len(channels)} channels, "
+        f"download_media={'yes' if download_media else 'no'}, "
+        f"youtube_sync={'yes' if bool(args.youtube_create_playlist or args.youtube_playlist_id) else 'no'}"
+    )
+    if args.limit:
+        log(f"Per-channel extraction limit is set to {args.limit}.")
+    if args.cookies_from_browser:
+        log(f"Using browser cookies from {args.cookies_from_browser}.")
+    elif args.cookies:
+        log(f"Using cookies file {args.cookies}.")
+    log(f"yt-dlp socket timeout is {args.socket_timeout:.1f}s.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if download_media:
@@ -591,14 +704,18 @@ def main() -> int:
     ydl_opts = make_ydl_opts(args, args.library_dir, download_media)
     all_records: list[VideoRecord] = []
     with YoutubeDL(ydl_opts) as ydl:
-        for channel in channels:
-            print(f"Collecting videos from {channel}...", flush=True)
+        for index, channel in enumerate(channels, start=1):
+            log(f"Collecting channel {index}/{len(channels)}: {channel}")
             all_records.extend(collect_channel_records(channel, ydl, download_media))
 
-    records = dedupe_records(sort_records(all_records))
-    records = limit_records(records, args.limit)
+    log(f"Collected {len(all_records)} raw records across all channels.")
+    deduped_records = dedupe_records(all_records)
+    log(f"Kept {len(deduped_records)} unique records after dedupe.")
+    records = sort_records(deduped_records)
     records = shuffle_records(records, args.shuffle_seed)
-    print(f"Collected {len(records)} unique videos.", flush=True)
+    if args.shuffle_seed is not None:
+        log(f"Shuffled {len(records)} records with seed {args.shuffle_seed}.")
+    log(f"Collected {len(records)} final videos for output.")
     manifest_path = args.output_dir / f"{args.playlist_name}.manifest.json"
     playlist_path = args.output_dir / f"{args.playlist_name}.m3u"
 
@@ -607,11 +724,14 @@ def main() -> int:
         youtube_result = create_youtube_playlist(args, records)
 
     write_manifest(manifest_path, records, youtube_result)
+    log(f"Wrote manifest to {manifest_path}")
     write_playlist(playlist_path, records, use_web_urls=not download_media)
+    log(f"Wrote playlist to {playlist_path}")
     sync_log_path = args.output_dir / f"{args.playlist_name}.sync-log.jsonl"
     if youtube_result and args.youtube_playlist_id and not args.youtube_replace_existing:
         added_entries = [AddedVideoRecord(**entry) for entry in youtube_result.get("youtube_added_videos_log", [])]
         append_sync_log(sync_log_path, added_entries)
+        log(f"Appended {len(added_entries)} entries to sync log {sync_log_path}")
 
     print(f"Processed {len(records)} videos from {len(channels)} channels.")
     print(f"Manifest: {manifest_path}")
@@ -628,6 +748,7 @@ def main() -> int:
             )
     elif (args.youtube_create_playlist or args.youtube_playlist_id) and args.dry_run:
         print("Dry run enabled: skipped YouTube playlist creation.")
+    log(f"Run completed in {perf_counter() - run_started_at:.1f}s")
     return 0
 
 

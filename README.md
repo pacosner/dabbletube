@@ -1,17 +1,17 @@
 # Dabbleverse
 
-`dabbleverse` collects videos from multiple YouTube channels and, by default, creates a shuffled playlist from metadata without downloading media files.
+`dabbleverse` collects videos from multiple YouTube channels and, by default, creates a newest-added-first playlist from metadata without downloading media files.
 
 ## What it does
 
 - accepts one or more YouTube channel URLs, `@handle` values, or channel IDs
 - collects all available videos by default unless you set `--limit`
-- prefers newest uploads first when deciding which videos to include
+- preserves add order and keeps the newest additions first
 - creates a YouTube playlist from the collected video IDs
-- shuffles the final playlist order before writing it
+- optionally shuffles the final playlist order when you pass `--shuffle-seed`
 - optionally downloads channel videos with `yt-dlp` when you pass `--download-media`
 - stores a JSON manifest with metadata about downloaded files
-- creates a merged playlist sorted by upload date
+- creates a merged playlist sorted by added order, newest first
 
 ## Quick start
 
@@ -138,9 +138,11 @@ That mode:
 dabbleverse --help
 ```
 
-- `--limit 25` keeps the latest 25 collected videos before shuffling
-- `--shuffle-seed 42` makes the shuffled order reproducible
+- `--limit 25` keeps the first 25 collected videos in added order
+- `--shuffle-seed 42` enables shuffling and makes that shuffled order reproducible
 - `--request-sleep 2` waits between YouTube requests to reduce rate limiting
+- `--cookies-from-browser chrome` imports your YouTube cookies from a local browser session
+- `--cookies /path/to/cookies.txt` uses an exported Netscape-format cookies file
 - `--youtube-create-playlist` creates a real playlist on your YouTube account
 - `--youtube-playlist-id PL...` targets an existing playlist instead of creating a new one
 - `--youtube-replace-existing` clears an existing playlist before repopulating it
@@ -159,3 +161,4 @@ dabbleverse --help
 - Some extracted entries, especially live placeholders or unavailable videos, may be skipped if YouTube rejects them during playlist insertion.
 - If YouTube rate-limits the current session, wait for the cooldown window and rerun with a higher `--request-sleep` value.
 - Some YouTube channels or videos may be unavailable because of region, age, or login restrictions.
+- For age-restricted videos, rerun with `--cookies-from-browser <browser>` or `--cookies /path/to/cookies.txt` so yt-dlp can access your signed-in YouTube session.
