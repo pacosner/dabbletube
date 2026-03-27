@@ -180,6 +180,11 @@ def parse_args() -> argparse.Namespace:
         help="When used with --youtube-playlist-id, remove current playlist items before adding new ones.",
     )
     parser.add_argument(
+        "--youtube-prune-older-than-days",
+        type=float,
+        help="When used with --youtube-playlist-id, remove playlist items added more than N days ago before syncing.",
+    )
+    parser.add_argument(
         "--youtube-client-secrets",
         type=Path,
         help="Path to the Google OAuth client secrets JSON for a desktop app.",
@@ -487,6 +492,8 @@ def require_youtube_args(args: argparse.Namespace) -> None:
         raise SystemExit("--youtube-client-secrets is required for YouTube playlist updates.")
     if args.youtube_replace_existing and not args.youtube_playlist_id:
         raise SystemExit("--youtube-replace-existing requires --youtube-playlist-id.")
+    if args.youtube_prune_older_than_days and not args.youtube_playlist_id:
+        raise SystemExit("--youtube-prune-older-than-days requires --youtube-playlist-id.")
 
 
 def clear_existing_playlist(youtube: Any, playlist_id: str) -> int:
@@ -526,6 +533,15 @@ def clear_existing_playlist(youtube: Any, playlist_id: str) -> int:
     return removed
 
 
+def parse_api_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def get_existing_playlist_video_ids(youtube: Any, playlist_id: str) -> set[str]:
     existing_video_ids: set[str] = set()
     next_page_token: str | None = None
@@ -560,6 +576,51 @@ def get_existing_playlist_video_ids(youtube: Any, playlist_id: str) -> set[str]:
     return existing_video_ids
 
 
+def prune_existing_playlist_items(youtube: Any, playlist_id: str, prune_older_than_days: float) -> tuple[int, set[str]]:
+    cutoff = datetime.now().astimezone().timestamp() - (prune_older_than_days * 86400)
+    remaining_video_ids: set[str] = set()
+    removed = 0
+    next_page_token: str | None = None
+    page = 0
+
+    while True:
+        page += 1
+        log(f"Loading existing playlist items page {page} for prune check...")
+        response = (
+            youtube.playlistItems()
+            .list(
+                part="id,snippet",
+                playlistId=playlist_id,
+                maxResults=50,
+                pageToken=next_page_token,
+            )
+            .execute()
+        )
+
+        items = response.get("items", [])
+        for item in items:
+            snippet = item.get("snippet", {})
+            playlist_item_id = item.get("id")
+            video_id = snippet.get("resourceId", {}).get("videoId")
+            added_at = parse_api_datetime(snippet.get("publishedAt"))
+            should_prune = bool(playlist_item_id and added_at and added_at.timestamp() < cutoff)
+            if should_prune:
+                youtube.playlistItems().delete(id=playlist_item_id).execute()
+                removed += 1
+                continue
+            if video_id:
+                remaining_video_ids.add(video_id)
+
+        if removed and (removed % 25 == 0):
+            log(f"Pruned {removed} existing playlist items so far...")
+
+        next_page_token = response.get("nextPageToken")
+        if not next_page_token:
+            break
+
+    return removed, remaining_video_ids
+
+
 def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]) -> dict[str, Any]:
     require_youtube_args(args)
     from googleapiclient.errors import HttpError
@@ -571,6 +632,7 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
     created_new = False
     replaced_existing = False
     removed_item_count = 0
+    pruned_item_count = 0
     existing_video_ids: set[str] = set()
     if args.youtube_playlist_id:
         playlist_id = args.youtube_playlist_id
@@ -581,8 +643,22 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
             replaced_existing = True
             print(f"Removed {removed_item_count} existing playlist items.", flush=True)
         else:
-            print(f"Loading existing items from playlist {playlist_id}...", flush=True)
-            existing_video_ids = get_existing_playlist_video_ids(youtube, playlist_id)
+            if args.youtube_prune_older_than_days and args.youtube_prune_older_than_days > 0:
+                print(
+                    f"Pruning playlist items older than {args.youtube_prune_older_than_days:g} days from {playlist_id}...",
+                    flush=True,
+                )
+                pruned_item_count, existing_video_ids = prune_existing_playlist_items(
+                    youtube, playlist_id, args.youtube_prune_older_than_days
+                )
+                print(
+                    f"Pruned {pruned_item_count} playlist items older than "
+                    f"{args.youtube_prune_older_than_days:g} days.",
+                    flush=True,
+                )
+            else:
+                print(f"Loading existing items from playlist {playlist_id}...", flush=True)
+                existing_video_ids = get_existing_playlist_video_ids(youtube, playlist_id)
             print(f"Found {len(existing_video_ids)} existing videos. Only new videos will be added.", flush=True)
     else:
         print(f"Creating YouTube playlist '{title}'...", flush=True)
@@ -673,6 +749,7 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
         "youtube_created_new_playlist": created_new,
         "youtube_replaced_existing_playlist": replaced_existing,
         "youtube_removed_existing_item_count": removed_item_count,
+        "youtube_pruned_item_count": pruned_item_count,
         "youtube_already_present_video_count": len(already_present_video_ids),
         "youtube_already_present_video_ids": already_present_video_ids,
         "youtube_video_count": len(added_video_ids),
