@@ -273,7 +273,7 @@ def make_ydl_opts(args: argparse.Namespace, library_dir: Path, download_media: b
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "extract_flat": "in_playlist" if not download_media else False,
+        "extract_flat": False,
         "outtmpl": str(library_dir / "%(uploader)s" / "%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"),
         "restrictfilenames": False,
         "windowsfilenames": False,
@@ -296,6 +296,7 @@ def make_ydl_opts(args: argparse.Namespace, library_dir: Path, download_media: b
     if not download_media:
         opts["skip_download"] = True
         opts["simulate"] = True
+        opts["ignore_no_formats_error"] = True
     return opts
 
 
@@ -360,7 +361,14 @@ def coerce_iso_datetime(entry: dict[str, Any]) -> str | None:
 
 
 def sort_records(records: list[VideoRecord]) -> list[VideoRecord]:
-    return list(records)
+    def sort_key(record: VideoRecord) -> tuple[int, str, str, str]:
+        if record.published_at:
+            return (0, record.published_at, record.channel_title.lower(), record.title.lower())
+        if record.upload_date and record.upload_date.isdigit():
+            return (1, record.upload_date, record.channel_title.lower(), record.title.lower())
+        return (2, "", record.channel_title.lower(), record.title.lower())
+
+    return sorted(records, key=sort_key, reverse=True)
 
 
 def sort_records_by_upload_date(records: list[VideoRecord]) -> list[VideoRecord]:
@@ -602,11 +610,11 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
     already_present_video_ids: list[str] = []
     records_with_ids = [record for record in records if record.video_id]
     if args.youtube_create_playlist or args.youtube_replace_existing:
-        records_to_add = sort_records_by_upload_date(records_with_ids)
-        log("Using upload-date order for full playlist creation/rebuild, newest first.")
+        records_to_add = list(reversed(sort_records_by_upload_date(records_with_ids)))
+        log("Using upload-date order for full playlist creation/rebuild, oldest first so newest ends up first.")
     else:
         records_to_add = list(reversed(records_with_ids))
-        log("Using added-order upload for incremental sync, newest additions first.")
+        log("Using added-order upload for incremental sync, oldest first so newest ends up first.")
     total = len(records_to_add)
     log(f"Preparing to add {total} videos with valid IDs to YouTube playlist...")
     for index, record in enumerate(records_to_add, start=1):
