@@ -2,9 +2,26 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/output}"
+LAST_SUCCESS_FILE="${DABBLEVERSE_LAST_SUCCESS_FILE:-$OUTPUT_DIR/last-successful-run.txt}"
+
+mkdir -p "$OUTPUT_DIR"
+
+timeframe_args=(--channel-source youtube-api)
+if [[ -f "$LAST_SUCCESS_FILE" ]]; then
+  last_success="$(<"$LAST_SUCCESS_FILE")"
+  if filter_timestamp="$(date -d "$last_success" -Is 2>/dev/null)"; then
+    printf 'Using incremental window since last successful run %s (published-after=%s)\n' "$last_success" "$filter_timestamp"
+    timeframe_args+=(--published-after "$filter_timestamp")
+  else
+    printf 'Ignoring unreadable last-success timestamp in %s: %s\n' "$LAST_SUCCESS_FILE" "$last_success" >&2
+  fi
+fi
+
 dabbleverse \
-  --limit 5 \
-  --cookies /home/pacos/dabbletube/cookies.txt \
   --youtube-playlist-id PLieDuyulq1X7z4ch-V_oGGoVkuZJy8nSQ \
-  --youtube-client-secrets /home/pacos/dabbletube/secret.json \
-  --youtube-prune-older-than-days 7
+  --youtube-client-secrets "$SCRIPT_DIR/secret.json" \
+  "${timeframe_args[@]}"
+
+date -Is >"$LAST_SUCCESS_FILE"

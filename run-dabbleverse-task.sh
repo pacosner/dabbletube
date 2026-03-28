@@ -2,8 +2,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TASK_NAME="${TASK_NAME:-Dabbleverse}"
-PROJECT_DIR="/home/pacos/dabbletube"
+PROJECT_DIR="${PROJECT_DIR:-$SCRIPT_DIR}"
 LOG_PATH="${LOG_PATH:-$PROJECT_DIR/output/task.log}"
 
 mkdir -p "$(dirname "$LOG_PATH")"

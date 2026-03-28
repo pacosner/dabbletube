@@ -132,6 +132,8 @@ That mode:
 - leaves the existing playlist items in place
 - appends each newly added video to `output/combined.sync-log.jsonl`
 
+For scheduled runs, the included [dabbleverse-default](/home/pacos/dabbletube/dabbleverse-default) script also keeps `output/last-successful-run.txt` and feeds that back into yt-dlp so each run focuses on recent uploads.
+
 ## Useful options
 
 ```bash
@@ -140,6 +142,7 @@ dabbleverse --help
 
 - `--limit 25` keeps the first 25 collected videos in added order
 - `--shuffle-seed 42` enables shuffling and makes that shuffled order reproducible
+- `--dateafter YYYYMMDD` only collects videos uploaded on or after the given date
 - `--request-sleep 2` waits between YouTube requests to reduce rate limiting
 - `--cookies-from-browser chrome` imports your YouTube cookies from a local browser session
 - `--cookies /path/to/cookies.txt` uses an exported Netscape-format cookies file
@@ -190,3 +193,71 @@ powershell -ExecutionPolicy Bypass -File C:\Users\pacos\dabbletube\register-dabb
 ```
 
 The task writes run output to `output/task.log`.
+
+The default task script also stores the last successful run time in `output/last-successful-run.txt` and uses it on the next run. Because yt-dlp's date filter is day-based rather than hour-based, the script intentionally overlaps by one day so it does not miss same-day uploads; syncing to an existing YouTube playlist still avoids duplicate adds.
+
+## Native WSL cron
+
+If you want the job scheduled inside WSL instead of Windows Task Scheduler:
+
+```bash
+cd /home/pacos/dabbletube
+chmod +x install-wsl-cron.sh run-dabbleverse-task.sh
+./install-wsl-cron.sh
+```
+
+That installs this hourly entry in your user crontab:
+
+```cron
+0 * * * * /bin/bash "/home/pacos/dabbletube/run-dabbleverse-task.sh" # dabbleverse-task
+```
+
+To use a different schedule, override `CRON_SCHEDULE`:
+
+```bash
+CRON_SCHEDULE="*/30 * * * *" ./install-wsl-cron.sh
+```
+
+Useful commands:
+
+```bash
+crontab -l
+crontab -e
+```
+
+WSL note:
+
+- `cron` only runs while the WSL distro is running.
+- Native WSL cron does not wake a fully stopped distro by itself.
+- If you need guaranteed runs after Windows startup, launch the distro at login or boot and let cron handle the recurring schedule from there.
+
+### Start WSL At Login
+
+To wake the distro at Windows login so native WSL cron can keep running, register a logon task from Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\pacos\dabbletube\register-wsl-login-task.ps1 -RunNow
+```
+
+If you want to target a specific distro explicitly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\pacos\dabbletube\register-wsl-login-task.ps1 `
+  -DistroName "Ubuntu" `
+  -WslUser "pacos" `
+  -RunNow
+```
+
+That task starts WSL at logon and runs:
+
+```bash
+systemctl start cron >/dev/null 2>&1 || true
+```
+
+Useful Windows commands:
+
+```powershell
+Get-ScheduledTask -TaskName "Start WSL At Login"
+Start-ScheduledTask -TaskName "Start WSL At Login"
+Unregister-ScheduledTask -TaskName "Start WSL At Login" -Confirm:$false
+```

@@ -5,7 +5,7 @@ import json
 import random
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Thread
 from time import perf_counter
@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from typing import Any
 
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DateRange
 
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube"]
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -115,6 +116,12 @@ def parse_args() -> argparse.Namespace:
         help="Base name for generated local output files.",
     )
     parser.add_argument(
+        "--channel-source",
+        choices=["yt-dlp", "youtube-api"],
+        default="yt-dlp",
+        help="How to collect channel videos. Defaults to yt-dlp.",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         help="Maximum number of videos to process per channel. Defaults to all available videos.",
@@ -127,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-sleep",
         type=float,
-        default=1.5,
+        default=.5,
         help="Seconds to sleep between YouTube requests to reduce rate limiting. Defaults to 1.5.",
     )
     parser.add_argument(
@@ -135,6 +142,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=30.0,
         help="Network socket timeout in seconds for yt-dlp requests. Defaults to 30.",
+    )
+    parser.add_argument(
+        "--dateafter",
+        help="Collect only videos uploaded on or after this date, for example 20260328 or today-7days.",
+    )
+    parser.add_argument(
+        "--published-after",
+        help="Collect only videos published after this ISO 8601 timestamp, for example 2026-03-28T13:00:00Z.",
     )
     parser.add_argument(
         "--cookies",
@@ -270,6 +285,8 @@ def normalize_channel_url(value: str) -> str:
 def should_download_media(args: argparse.Namespace) -> bool:
     if args.dry_run:
         return False
+    if args.channel_source == "youtube-api":
+        return False
     return args.download_media
 
 
@@ -286,6 +303,8 @@ def make_ydl_opts(args: argparse.Namespace, library_dir: Path, download_media: b
         "socket_timeout": args.socket_timeout,
         "logger": YtDlpLogger(),
     }
+    if args.dateafter:
+        opts["daterange"] = DateRange(args.dateafter, None)
     if args.limit and args.limit > 0:
         opts["playlistend"] = args.limit
     if args.cookies:
@@ -303,6 +322,158 @@ def make_ydl_opts(args: argparse.Namespace, library_dir: Path, download_media: b
         opts["simulate"] = True
         opts["ignore_no_formats_error"] = True
     return opts
+
+
+def require_youtube_api_collection_args(args: argparse.Namespace) -> None:
+    if args.channel_source != "youtube-api":
+        return
+    if args.download_media:
+        raise SystemExit("--download-media is not supported with --channel-source youtube-api.")
+    if args.cookies or args.cookies_from_browser:
+        log("Ignoring cookie settings because --channel-source youtube-api does not use yt-dlp scraping.")
+    if not args.youtube_client_secrets:
+        raise SystemExit("--youtube-client-secrets is required with --channel-source youtube-api.")
+
+
+def parse_rfc3339_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def format_utc_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def extract_channel_handle_or_id(channel_input: str) -> tuple[str, str]:
+    value = channel_input.strip()
+    if value.startswith("@"):
+        return ("handle", value.lstrip("@"))
+    if value.startswith("UC") and len(value) >= 20:
+        return ("id", value)
+    if value.startswith("http://") or value.startswith("https://"):
+        parsed = urlparse(value)
+        path = parsed.path.strip("/")
+        if path.startswith("@"):
+            return ("handle", path.split("/", 1)[0].lstrip("@"))
+        if path.startswith("channel/"):
+            channel_id = path.split("/", 2)[1]
+            if channel_id:
+                return ("id", channel_id)
+    raise SystemExit(
+        f"Unsupported channel input for --channel-source youtube-api: {channel_input}. "
+        "Use an @handle, channel ID, or youtube.com/@handle URL."
+    )
+
+
+def resolve_channel_for_api(youtube: Any, channel_input: str) -> dict[str, str]:
+    identifier_type, identifier_value = extract_channel_handle_or_id(channel_input)
+    request_kwargs: dict[str, Any] = {"part": "snippet"}
+    if identifier_type == "id":
+        request_kwargs["id"] = identifier_value
+    else:
+        request_kwargs["forHandle"] = identifier_value
+    response = youtube.channels().list(**request_kwargs).execute()
+    items = response.get("items", [])
+    if not items:
+        raise SystemExit(f"Could not resolve channel from input: {channel_input}")
+    item = items[0]
+    snippet = item.get("snippet", {})
+    return {
+        "channel_id": item.get("id", ""),
+        "channel_title": snippet.get("title") or channel_input,
+    }
+
+
+def collect_channel_records_from_api(
+    youtube: Any,
+    channel_input: str,
+    limit: int | None,
+    published_after: datetime | None,
+) -> list[VideoRecord]:
+    channel_info = resolve_channel_for_api(youtube, channel_input)
+    request_kwargs: dict[str, Any] = {
+        "part": "snippet",
+        "channelId": channel_info["channel_id"],
+        "order": "date",
+        "type": "video",
+        "maxResults": min(limit, 50) if limit and limit > 0 else 50,
+    }
+    if published_after:
+        request_kwargs["publishedAfter"] = format_utc_timestamp(published_after)
+
+    started_at = perf_counter()
+    stop_event, watch_thread = start_progress_watch(f"YouTube API fetch for {channel_input}")
+    try:
+        response = youtube.search().list(**request_kwargs).execute()
+    finally:
+        stop_event.set()
+        watch_thread.join(timeout=0.1)
+
+    items = response.get("items", [])
+    records: list[VideoRecord] = []
+    for item in items:
+        snippet = item.get("snippet", {})
+        video_id = item.get("id", {}).get("videoId") or ""
+        published_at = snippet.get("publishedAt")
+        upload_date = None
+        parsed_published_at = parse_api_datetime(published_at)
+        if parsed_published_at:
+            upload_date = parsed_published_at.strftime("%Y%m%d")
+        records.append(
+            VideoRecord(
+                channel_input=channel_input,
+                channel_title=snippet.get("channelTitle") or channel_info["channel_title"],
+                title=snippet.get("title") or video_id or "Untitled",
+                video_id=video_id,
+                webpage_url=f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
+                upload_date=upload_date,
+                published_at=published_at,
+                local_path=None,
+                extractor="youtube-api",
+            )
+        )
+    log(
+        f"Finished {channel_info['channel_title']}: collected {len(records)} records via YouTube API "
+        f"in {perf_counter() - started_at:.1f}s"
+    )
+    return records
+
+
+def collect_records(args: argparse.Namespace, channels: list[str], download_media: bool) -> list[VideoRecord]:
+    if args.channel_source == "youtube-api":
+        require_youtube_api_collection_args(args)
+        youtube = build_youtube_client(args.youtube_client_secrets, args.youtube_token_file)
+        published_after = parse_rfc3339_datetime(args.published_after)
+        if args.published_after and not published_after:
+            raise SystemExit(f"Invalid --published-after timestamp: {args.published_after}")
+        all_records: list[VideoRecord] = []
+        for index, channel in enumerate(channels, start=1):
+            log(f"Collecting channel {index}/{len(channels)} via YouTube API: {channel}")
+            all_records.extend(
+                collect_channel_records_from_api(
+                    youtube=youtube,
+                    channel_input=channel,
+                    limit=args.limit,
+                    published_after=published_after,
+                )
+            )
+        return all_records
+
+    ydl_opts = make_ydl_opts(args, args.library_dir, download_media)
+    all_records: list[VideoRecord] = []
+    with YoutubeDL(ydl_opts) as ydl:
+        for index, channel in enumerate(channels, start=1):
+            log(f"Collecting channel {index}/{len(channels)}: {channel}")
+            all_records.extend(collect_channel_records(channel, ydl, download_media))
+    return all_records
 
 
 def collect_channel_records(channel_input: str, ydl: YoutubeDL, download_media: bool) -> list[VideoRecord]:
@@ -767,11 +938,16 @@ def main() -> int:
 
     log(
         f"Starting dabbleverse with {len(channels)} channels, "
+        f"channel_source={args.channel_source}, "
         f"download_media={'yes' if download_media else 'no'}, "
         f"youtube_sync={'yes' if bool(args.youtube_create_playlist or args.youtube_playlist_id) else 'no'}"
     )
     if args.limit:
         log(f"Per-channel extraction limit is set to {args.limit}.")
+    if args.published_after:
+        log(f"Published-after filter is set to {args.published_after}.")
+    elif args.dateafter:
+        log(f"Date-after filter is set to {args.dateafter}.")
     if args.cookies_from_browser:
         log(f"Using browser cookies from {args.cookies_from_browser}.")
     elif args.cookies:
@@ -783,15 +959,10 @@ def main() -> int:
         args.library_dir.mkdir(parents=True, exist_ok=True)
     if args.archive_file:
         args.archive_file.parent.mkdir(parents=True, exist_ok=True)
-    if args.youtube_create_playlist or args.youtube_playlist_id:
+    if args.youtube_create_playlist or args.youtube_playlist_id or args.channel_source == "youtube-api":
         args.youtube_token_file.parent.mkdir(parents=True, exist_ok=True)
 
-    ydl_opts = make_ydl_opts(args, args.library_dir, download_media)
-    all_records: list[VideoRecord] = []
-    with YoutubeDL(ydl_opts) as ydl:
-        for index, channel in enumerate(channels, start=1):
-            log(f"Collecting channel {index}/{len(channels)}: {channel}")
-            all_records.extend(collect_channel_records(channel, ydl, download_media))
+    all_records = collect_records(args, channels, download_media)
 
     log(f"Collected {len(all_records)} raw records across all channels.")
     deduped_records = dedupe_records(all_records)
