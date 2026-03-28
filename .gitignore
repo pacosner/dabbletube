@@ -11,3 +11,5 @@ library/
 output/
 
 dabbleverse.egg-info/
+
+cookies.*

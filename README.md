@@ -162,3 +162,31 @@ dabbleverse --help
 - If YouTube rate-limits the current session, wait for the cooldown window and rerun with a higher `--request-sleep` value.
 - Some YouTube channels or videos may be unavailable because of region, age, or login restrictions.
 - For age-restricted videos, rerun with `--cookies-from-browser <browser>` or `--cookies /path/to/cookies.txt` so yt-dlp can access your signed-in YouTube session.
+
+## Windows Task Scheduler
+
+If you want Windows Task Scheduler to run the WSL wrapper, point it at `run-dabbleverse-task.bat`.
+
+Manual Task Scheduler values:
+
+- Program/script: `C:\Users\pacos\dabbletube\run-dabbleverse-task.bat`
+- Start in: `C:\Users\pacos\dabbletube`
+- Trigger: daily, repeating every 1 hour
+
+PowerShell registration helper:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\pacos\dabbletube\register-dabbleverse-task.ps1
+```
+
+Optional arguments:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\pacos\dabbletube\register-dabbleverse-task.ps1 `
+  -TaskName "Dabbleverse Hourly" `
+  -RepoPath "C:\Users\pacos\dabbletube" `
+  -StartTime "09:00" `
+  -RepeatMinutes 60
+```
+
+The task writes run output to `output/task.log`.

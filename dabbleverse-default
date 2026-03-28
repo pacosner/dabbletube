@@ -4,7 +4,7 @@ set -euo pipefail
 
 dabbleverse \
   --limit 5 \
-  --cookies-from-browser brave \
+  --cookies /home/pacos/dabbletube/cookies.txt \
   --youtube-playlist-id PLieDuyulq1X7z4ch-V_oGGoVkuZJy8nSQ \
-  --youtube-client-secrets /Users/patrick/Projects/dabbleverse/secret.json \
+  --youtube-client-secrets /home/pacos/dabbletube/secret.json \
   --youtube-prune-older-than-days 7
