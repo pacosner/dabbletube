@@ -132,7 +132,7 @@ That mode:
 - leaves the existing playlist items in place
 - appends each newly added video to `output/combined.sync-log.jsonl`
 
-For scheduled runs, the included [dabbleverse-default](/home/pacos/dabbletube/dabbleverse-default) script also keeps `output/last-successful-run.txt` and feeds that back into yt-dlp so each run focuses on recent uploads.
+For scheduled runs, the included [dabbleverse-default](/home/pacos/dabbletube/dabbleverse-default) script also keeps `output/last-successful-run.txt` and feeds a slightly overlapped `--published-after` timestamp back into the YouTube API collector so each run focuses on recent uploads without missing slightly older backfilled videos.
 
 ## Useful options
 
@@ -165,65 +165,6 @@ dabbleverse --help
 - If YouTube rate-limits the current session, wait for the cooldown window and rerun with a higher `--request-sleep` value.
 - Some YouTube channels or videos may be unavailable because of region, age, or login restrictions.
 - For age-restricted videos, rerun with `--cookies-from-browser <browser>` or `--cookies /path/to/cookies.txt` so yt-dlp can access your signed-in YouTube session.
-
-## Windows Task Scheduler
-
-If you want Windows Task Scheduler to run the WSL wrapper, point it at `run-dabbleverse-task.bat`.
-
-Manual Task Scheduler values:
-
-- Program/script: `C:\Users\pacos\dabbletube\run-dabbleverse-task.bat`
-- Start in: `C:\Users\pacos\dabbletube`
-- Trigger: daily, repeating every 1 hour
-
-PowerShell registration helper:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File C:\Users\pacos\dabbletube\register-dabbleverse-task.ps1
-```
-
-Optional arguments:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File C:\Users\pacos\dabbletube\register-dabbleverse-task.ps1 `
-  -TaskName "Dabbleverse Hourly" `
-  -RepoPath "C:\Users\pacos\dabbletube" `
-  -StartTime "09:00" `
-  -RepeatMinutes 60
-```
-
-The task writes run output to `output/task.log`.
-
-The default task script also stores the last successful run time in `output/last-successful-run.txt` and uses it on the next run. Because yt-dlp's date filter is day-based rather than hour-based, the script intentionally overlaps by one day so it does not miss same-day uploads; syncing to an existing YouTube playlist still avoids duplicate adds.
-
-## Native WSL cron
-
-If you want the job scheduled inside WSL instead of Windows Task Scheduler:
-
-```bash
-cd /home/pacos/dabbletube
-chmod +x install-wsl-cron.sh run-dabbleverse-task.sh
-./install-wsl-cron.sh
-```
-
-That installs this hourly entry in your user crontab:
-
-```cron
-0 * * * * /bin/bash "/home/pacos/dabbletube/run-dabbleverse-task.sh" # dabbleverse-task
-```
-
-To use a different schedule, override `CRON_SCHEDULE`:
-
-```bash
-CRON_SCHEDULE="*/30 * * * *" ./install-wsl-cron.sh
-```
-
-Useful commands:
-
-```bash
-crontab -l
-crontab -e
-```
 
 WSL note:
 

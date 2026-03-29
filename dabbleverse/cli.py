@@ -11,6 +11,7 @@ from threading import Event, Thread
 from time import perf_counter
 from urllib.parse import urlparse
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DateRange
@@ -18,6 +19,7 @@ from yt_dlp.utils import DateRange
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube"]
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 DEFAULT_CHANNELS_FILE = Path("channels.txt")
+YOUTUBE_QUOTA_BLOCK_FILE = "youtube-quota-blocked-until.txt"
 
 
 @dataclass(slots=True)
@@ -348,10 +350,6 @@ def parse_rfc3339_datetime(value: str | None) -> datetime | None:
     return parsed
 
 
-def format_utc_timestamp(value: datetime) -> str:
-    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
 def extract_channel_handle_or_id(channel_input: str) -> tuple[str, str]:
     value = channel_input.strip()
     if value.startswith("@"):
@@ -375,7 +373,7 @@ def extract_channel_handle_or_id(channel_input: str) -> tuple[str, str]:
 
 def resolve_channel_for_api(youtube: Any, channel_input: str) -> dict[str, str]:
     identifier_type, identifier_value = extract_channel_handle_or_id(channel_input)
-    request_kwargs: dict[str, Any] = {"part": "snippet"}
+    request_kwargs: dict[str, Any] = {"part": "snippet,contentDetails"}
     if identifier_type == "id":
         request_kwargs["id"] = identifier_value
     else:
@@ -386,9 +384,17 @@ def resolve_channel_for_api(youtube: Any, channel_input: str) -> dict[str, str]:
         raise SystemExit(f"Could not resolve channel from input: {channel_input}")
     item = items[0]
     snippet = item.get("snippet", {})
+    uploads_playlist_id = (
+        item.get("contentDetails", {})
+        .get("relatedPlaylists", {})
+        .get("uploads", "")
+    )
+    if not uploads_playlist_id:
+        raise SystemExit(f"Could not resolve uploads playlist for channel: {channel_input}")
     return {
         "channel_id": item.get("id", ""),
         "channel_title": snippet.get("title") or channel_input,
+        "uploads_playlist_id": uploads_playlist_id,
     }
 
 
@@ -399,47 +405,64 @@ def collect_channel_records_from_api(
     published_after: datetime | None,
 ) -> list[VideoRecord]:
     channel_info = resolve_channel_for_api(youtube, channel_input)
-    request_kwargs: dict[str, Any] = {
-        "part": "snippet",
-        "channelId": channel_info["channel_id"],
-        "order": "date",
-        "type": "video",
-        "maxResults": min(limit, 50) if limit and limit > 0 else 50,
-    }
-    if published_after:
-        request_kwargs["publishedAfter"] = format_utc_timestamp(published_after)
-
     started_at = perf_counter()
     stop_event, watch_thread = start_progress_watch(f"YouTube API fetch for {channel_input}")
     try:
-        response = youtube.search().list(**request_kwargs).execute()
+        records: list[VideoRecord] = []
+        next_page_token: str | None = None
+        reached_cutoff = False
+        page_size = 50 if not limit or limit <= 0 else min(limit, 50)
+
+        while True:
+            request_kwargs: dict[str, Any] = {
+                "part": "snippet",
+                "playlistId": channel_info["uploads_playlist_id"],
+                "maxResults": page_size,
+            }
+            if next_page_token:
+                request_kwargs["pageToken"] = next_page_token
+
+            response = youtube.playlistItems().list(**request_kwargs).execute()
+            items = response.get("items", [])
+
+            for item in items:
+                snippet = item.get("snippet", {})
+                published_at = snippet.get("publishedAt")
+                parsed_published_at = parse_api_datetime(published_at)
+                if published_after and parsed_published_at and parsed_published_at <= published_after:
+                    reached_cutoff = True
+                    break
+
+                video_id = snippet.get("resourceId", {}).get("videoId") or ""
+                upload_date = parsed_published_at.strftime("%Y%m%d") if parsed_published_at else None
+                records.append(
+                    VideoRecord(
+                        channel_input=channel_input,
+                        channel_title=snippet.get("videoOwnerChannelTitle")
+                        or snippet.get("channelTitle")
+                        or channel_info["channel_title"],
+                        title=snippet.get("title") or video_id or "Untitled",
+                        video_id=video_id,
+                        webpage_url=f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
+                        upload_date=upload_date,
+                        published_at=published_at,
+                        local_path=None,
+                        extractor="youtube-api",
+                    )
+                )
+                if limit and limit > 0 and len(records) >= limit:
+                    reached_cutoff = True
+                    break
+
+            if reached_cutoff:
+                break
+
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
     finally:
         stop_event.set()
         watch_thread.join(timeout=0.1)
-
-    items = response.get("items", [])
-    records: list[VideoRecord] = []
-    for item in items:
-        snippet = item.get("snippet", {})
-        video_id = item.get("id", {}).get("videoId") or ""
-        published_at = snippet.get("publishedAt")
-        upload_date = None
-        parsed_published_at = parse_api_datetime(published_at)
-        if parsed_published_at:
-            upload_date = parsed_published_at.strftime("%Y%m%d")
-        records.append(
-            VideoRecord(
-                channel_input=channel_input,
-                channel_title=snippet.get("channelTitle") or channel_info["channel_title"],
-                title=snippet.get("title") or video_id or "Untitled",
-                video_id=video_id,
-                webpage_url=f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
-                upload_date=upload_date,
-                published_at=published_at,
-                local_path=None,
-                extractor="youtube-api",
-            )
-        )
     log(
         f"Finished {channel_info['channel_title']}: collected {len(records)} records via YouTube API "
         f"in {perf_counter() - started_at:.1f}s"
@@ -625,6 +648,37 @@ def append_sync_log(log_path: Path, entries: list[AddedVideoRecord]) -> None:
     with log_path.open("a", encoding="utf-8") as handle:
         for entry in entries:
             handle.write(json.dumps(asdict(entry)) + "\n")
+
+
+def is_youtube_quota_error(exc: Exception) -> bool:
+    content = getattr(exc, "content", b"")
+    if isinstance(content, bytes):
+        text = content.decode("utf-8", errors="ignore")
+    else:
+        text = str(content)
+    return "quotaExceeded" in text or "dailyLimitExceeded" in text
+
+
+def next_youtube_quota_reset(now: datetime | None = None) -> datetime:
+    current = now or datetime.now().astimezone()
+    pacific_now = current.astimezone(ZoneInfo("America/Los_Angeles"))
+    next_day = pacific_now.date().toordinal() + 1
+    next_midnight_pacific = datetime.fromordinal(next_day).replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+    return next_midnight_pacific.astimezone(current.tzinfo or timezone.utc)
+
+
+def write_quota_block_file(output_dir: Path) -> Path:
+    blocked_until = next_youtube_quota_reset()
+    path = output_dir / YOUTUBE_QUOTA_BLOCK_FILE
+    path.write_text(blocked_until.isoformat() + "\n", encoding="utf-8")
+    log(f"YouTube API quota exhausted. Blocking scheduled retries until {blocked_until.isoformat()}.")
+    return path
+
+
+def clear_quota_block_file(output_dir: Path) -> None:
+    path = output_dir / YOUTUBE_QUOTA_BLOCK_FILE
+    if path.exists():
+        path.unlink()
 
 
 def build_youtube_client(client_secrets_path: Path, token_path: Path):
@@ -962,7 +1016,13 @@ def main() -> int:
     if args.youtube_create_playlist or args.youtube_playlist_id or args.channel_source == "youtube-api":
         args.youtube_token_file.parent.mkdir(parents=True, exist_ok=True)
 
-    all_records = collect_records(args, channels, download_media)
+    try:
+        all_records = collect_records(args, channels, download_media)
+    except Exception as exc:
+        if is_youtube_quota_error(exc):
+            write_quota_block_file(args.output_dir)
+            return 75
+        raise
 
     log(f"Collected {len(all_records)} raw records across all channels.")
     deduped_records = dedupe_records(all_records)
@@ -977,7 +1037,13 @@ def main() -> int:
 
     youtube_result: dict[str, Any] | None = None
     if (args.youtube_create_playlist or args.youtube_playlist_id) and not args.dry_run:
-        youtube_result = create_youtube_playlist(args, records)
+        try:
+            youtube_result = create_youtube_playlist(args, records)
+        except Exception as exc:
+            if is_youtube_quota_error(exc):
+                write_quota_block_file(args.output_dir)
+                return 75
+            raise
 
     write_manifest(manifest_path, records, youtube_result)
     log(f"Wrote manifest to {manifest_path}")
@@ -1004,6 +1070,7 @@ def main() -> int:
             )
     elif (args.youtube_create_playlist or args.youtube_playlist_id) and args.dry_run:
         print("Dry run enabled: skipped YouTube playlist creation.")
+    clear_quota_block_file(args.output_dir)
     log(f"Run completed in {perf_counter() - run_started_at:.1f}s")
     return 0
 

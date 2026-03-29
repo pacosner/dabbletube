@@ -5,14 +5,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/output}"
 LAST_SUCCESS_FILE="${DABBLEVERSE_LAST_SUCCESS_FILE:-$OUTPUT_DIR/last-successful-run.txt}"
+QUOTA_BLOCK_FILE="${DABBLEVERSE_QUOTA_BLOCK_FILE:-$OUTPUT_DIR/youtube-quota-blocked-until.txt}"
+PUBLISHED_AFTER_OVERLAP="${DABBLEVERSE_PUBLISHED_AFTER_OVERLAP:-3 hours}"
 
 mkdir -p "$OUTPUT_DIR"
+
+if [[ -f "$QUOTA_BLOCK_FILE" ]]; then
+  blocked_until="$(<"$QUOTA_BLOCK_FILE")"
+  if blocked_until_epoch="$(date -d "$blocked_until" +%s 2>/dev/null)"; then
+    now_epoch="$(date +%s)"
+    if (( now_epoch < blocked_until_epoch )); then
+      printf 'Skipping run because YouTube quota is blocked until %s\n' "$blocked_until"
+      exit 0
+    fi
+  else
+    printf 'Ignoring unreadable quota-block timestamp in %s: %s\n' "$QUOTA_BLOCK_FILE" "$blocked_until" >&2
+  fi
+fi
 
 timeframe_args=(--channel-source youtube-api)
 if [[ -f "$LAST_SUCCESS_FILE" ]]; then
   last_success="$(<"$LAST_SUCCESS_FILE")"
-  if filter_timestamp="$(date -d "$last_success" -Is 2>/dev/null)"; then
-    printf 'Using incremental window since last successful run %s (published-after=%s)\n' "$last_success" "$filter_timestamp"
+  if filter_timestamp="$(date -d "$last_success - $PUBLISHED_AFTER_OVERLAP" -Is 2>/dev/null)"; then
+    printf 'Using incremental window since last successful run %s with overlap %s (published-after=%s)\n' "$last_success" "$PUBLISHED_AFTER_OVERLAP" "$filter_timestamp"
     timeframe_args+=(--published-after "$filter_timestamp")
   else
     printf 'Ignoring unreadable last-success timestamp in %s: %s\n' "$LAST_SUCCESS_FILE" "$last_success" >&2
