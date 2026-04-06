@@ -19,6 +19,7 @@ from yt_dlp.utils import DateRange
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube"]
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 DEFAULT_CHANNELS_FILE = Path("channels.txt")
+DEFAULT_VIDEOS_FILE = Path("manual-videos.txt")
 YOUTUBE_QUOTA_BLOCK_FILE = "youtube-quota-blocked-until.txt"
 
 
@@ -99,6 +100,17 @@ def parse_args() -> argparse.Namespace:
         "--channels-file",
         type=Path,
         help="Path to a text file containing one channel input per line. Defaults to ./channels.txt when present.",
+    )
+    parser.add_argument(
+        "--video",
+        action="append",
+        default=[],
+        help="YouTube video URL or ID to include directly. May be used multiple times.",
+    )
+    parser.add_argument(
+        "--videos-file",
+        type=Path,
+        help="Path to a text file containing one direct video URL or ID per line. Defaults to ./manual-videos.txt when present.",
     )
     parser.add_argument(
         "--library-dir",
@@ -249,7 +261,31 @@ def load_channels(args: argparse.Namespace) -> list[str]:
             seen.add(value)
             deduped.append(value)
     if not deduped:
-        raise SystemExit("No channels provided. Use --channel, --channels-file, or create ./channels.txt.")
+        return []
+    return deduped
+
+
+def load_videos(args: argparse.Namespace) -> list[str]:
+    videos = [normalize_video_input(value) for value in args.video]
+    videos_file = args.videos_file
+    if not videos and videos_file is None and DEFAULT_VIDEOS_FILE.exists():
+        videos_file = DEFAULT_VIDEOS_FILE
+        print(f"Using direct videos from {videos_file}...", flush=True)
+
+    if videos_file:
+        file_lines = videos_file.read_text(encoding="utf-8").splitlines()
+        videos.extend(
+            normalize_video_input(line)
+            for line in file_lines
+            if line.strip() and not line.strip().startswith("#")
+        )
+
+    deduped: list[str] = []
+    seen = set()
+    for value in videos:
+        if value not in seen:
+            seen.add(value)
+            deduped.append(value)
     return deduped
 
 
@@ -282,6 +318,15 @@ def normalize_channel_url(value: str) -> str:
     if path.startswith(channel_roots):
         return f"{value.rstrip('/')}/videos"
     return value
+
+
+def normalize_video_input(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return normalized
+    if is_valid_video_id(normalized):
+        return f"https://www.youtube.com/watch?v={normalized}"
+    return normalized
 
 
 def should_download_media(args: argparse.Namespace) -> bool:
@@ -470,14 +515,19 @@ def collect_channel_records_from_api(
     return records
 
 
-def collect_records(args: argparse.Namespace, channels: list[str], download_media: bool) -> list[VideoRecord]:
+def collect_records(
+    args: argparse.Namespace,
+    channels: list[str],
+    videos: list[str],
+    download_media: bool,
+) -> list[VideoRecord]:
+    all_records: list[VideoRecord] = []
     if args.channel_source == "youtube-api":
         require_youtube_api_collection_args(args)
         youtube = build_youtube_client(args.youtube_client_secrets, args.youtube_token_file)
         published_after = parse_rfc3339_datetime(args.published_after)
         if args.published_after and not published_after:
             raise SystemExit(f"Invalid --published-after timestamp: {args.published_after}")
-        all_records: list[VideoRecord] = []
         for index, channel in enumerate(channels, start=1):
             log(f"Collecting channel {index}/{len(channels)} via YouTube API: {channel}")
             all_records.extend(
@@ -488,14 +538,21 @@ def collect_records(args: argparse.Namespace, channels: list[str], download_medi
                     published_after=published_after,
                 )
             )
-        return all_records
 
-    ydl_opts = make_ydl_opts(args, args.library_dir, download_media)
-    all_records: list[VideoRecord] = []
-    with YoutubeDL(ydl_opts) as ydl:
-        for index, channel in enumerate(channels, start=1):
-            log(f"Collecting channel {index}/{len(channels)}: {channel}")
-            all_records.extend(collect_channel_records(channel, ydl, download_media))
+    if channels and args.channel_source == "yt-dlp":
+        ydl_opts = make_ydl_opts(args, args.library_dir, download_media)
+        with YoutubeDL(ydl_opts) as ydl:
+            for index, channel in enumerate(channels, start=1):
+                log(f"Collecting channel {index}/{len(channels)}: {channel}")
+                all_records.extend(collect_channel_records(channel, ydl, download_media))
+
+    if videos:
+        ydl_opts = make_ydl_opts(args, args.library_dir, download_media)
+        with YoutubeDL(ydl_opts) as ydl:
+            for index, video in enumerate(videos, start=1):
+                log(f"Collecting direct video {index}/{len(videos)}: {video}")
+                all_records.extend(collect_video_records(video, ydl, download_media))
+
     return all_records
 
 
@@ -547,6 +604,45 @@ def collect_channel_records(channel_input: str, ydl: YoutubeDL, download_media: 
         f"Finished {channel_title}: collected {len(records)} records in {perf_counter() - started_at:.1f}s"
     )
     return records
+
+
+def collect_video_records(video_input: str, ydl: YoutubeDL, download_media: bool) -> list[VideoRecord]:
+    started_at = perf_counter()
+    stop_event, watch_thread = start_progress_watch(f"video extraction for {video_input}")
+    try:
+        info = ydl.extract_info(video_input, download=download_media)
+    finally:
+        stop_event.set()
+        watch_thread.join(timeout=0.1)
+    if not info:
+        log(f"Finished {video_input}: no metadata returned in {perf_counter() - started_at:.1f}s")
+        return []
+
+    requested_downloads = info.get("requested_downloads") or []
+    local_path = None
+    if requested_downloads:
+        local_path = requested_downloads[0].get("filepath")
+    elif info.get("_filename"):
+        local_path = info["_filename"]
+
+    video_id = info.get("id") or ""
+    webpage_url = info.get("webpage_url") or info.get("original_url") or ""
+    if not webpage_url and video_id:
+        webpage_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    record = VideoRecord(
+        channel_input=video_input,
+        channel_title=info.get("channel") or info.get("uploader") or "Manual video",
+        title=info.get("title") or video_id or "Untitled",
+        video_id=video_id,
+        webpage_url=webpage_url,
+        upload_date=info.get("upload_date"),
+        published_at=coerce_iso_datetime(info),
+        local_path=local_path,
+        extractor=info.get("extractor_key") or info.get("extractor"),
+    )
+    log(f"Finished direct video {record.title}: collected 1 record in {perf_counter() - started_at:.1f}s")
+    return [record]
 
 
 def coerce_iso_datetime(entry: dict[str, Any]) -> str | None:
@@ -684,6 +780,7 @@ def clear_quota_block_file(output_dir: Path) -> None:
 def build_youtube_client(client_secrets_path: Path, token_path: Path):
     try:
         from google.auth.transport.requests import Request
+        from google.auth.exceptions import RefreshError
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
         from googleapiclient.discovery import build
@@ -698,7 +795,17 @@ def build_youtube_client(client_secrets_path: Path, token_path: Path):
 
     if creds and creds.expired and creds.refresh_token:
         print("Refreshing cached YouTube OAuth token...", flush=True)
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except RefreshError as exc:
+            # Google returns invalid_grant when the cached refresh token has been
+            # revoked or expired. Drop the stale cache and continue into the
+            # normal browser-based sign-in flow below.
+            print(f"Cached YouTube OAuth token refresh failed: {exc}", flush=True)
+            if token_path.exists():
+                token_path.unlink()
+                print(f"Deleted stale YouTube OAuth token at {token_path}", flush=True)
+            creds = None
 
     if not creds or not creds.valid:
         print("Starting Google sign-in flow in your browser...", flush=True)
@@ -988,10 +1095,15 @@ def main() -> int:
     run_started_at = perf_counter()
     args = parse_args()
     channels = load_channels(args)
+    videos = load_videos(args)
     download_media = should_download_media(args)
+    if not channels and not videos:
+        raise SystemExit(
+            "No inputs provided. Use --channel/--channels-file, --video/--videos-file, or create ./channels.txt or ./manual-videos.txt."
+        )
 
     log(
-        f"Starting dabbleverse with {len(channels)} channels, "
+        f"Starting dabbleverse with {len(channels)} channels and {len(videos)} direct videos, "
         f"channel_source={args.channel_source}, "
         f"download_media={'yes' if download_media else 'no'}, "
         f"youtube_sync={'yes' if bool(args.youtube_create_playlist or args.youtube_playlist_id) else 'no'}"
@@ -1017,7 +1129,7 @@ def main() -> int:
         args.youtube_token_file.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        all_records = collect_records(args, channels, download_media)
+        all_records = collect_records(args, channels, videos, download_media)
     except Exception as exc:
         if is_youtube_quota_error(exc):
             write_quota_block_file(args.output_dir)
@@ -1055,7 +1167,7 @@ def main() -> int:
         append_sync_log(sync_log_path, added_entries)
         log(f"Appended {len(added_entries)} entries to sync log {sync_log_path}")
 
-    print(f"Processed {len(records)} videos from {len(channels)} channels.")
+    print(f"Processed {len(records)} videos from {len(channels)} channels and {len(videos)} direct videos.")
     print(f"Manifest: {manifest_path}")
     print(f"Playlist: {playlist_path}")
     if youtube_result:
