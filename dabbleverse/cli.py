@@ -20,6 +20,7 @@ YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube"]
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 DEFAULT_CHANNELS_FILE = Path("channels.txt")
 DEFAULT_VIDEOS_FILE = Path("manual-videos.txt")
+DEFAULT_BLACKLIST_FILE = Path("blacklist.txt")
 YOUTUBE_QUOTA_BLOCK_FILE = "youtube-quota-blocked-until.txt"
 
 
@@ -111,6 +112,11 @@ def parse_args() -> argparse.Namespace:
         "--videos-file",
         type=Path,
         help="Path to a text file containing one direct video URL or ID per line. Defaults to ./manual-videos.txt when present.",
+    )
+    parser.add_argument(
+        "--blacklist-file",
+        type=Path,
+        help="Path to a text file containing one video URL or ID per line to exclude from download. Defaults to ./blacklist.txt when present.",
     )
     parser.add_argument(
         "--library-dir",
@@ -287,6 +293,24 @@ def load_videos(args: argparse.Namespace) -> list[str]:
             seen.add(value)
             deduped.append(value)
     return deduped
+
+
+def load_blacklist(args: argparse.Namespace) -> set[str]:
+    blacklist: set[str] = set()
+    blacklist_file = args.blacklist_file
+    if blacklist_file is None and DEFAULT_BLACKLIST_FILE.exists():
+        blacklist_file = DEFAULT_BLACKLIST_FILE
+        print(f"Using blacklist from {blacklist_file}...", flush=True)
+
+    if blacklist_file:
+        file_lines = blacklist_file.read_text(encoding="utf-8").splitlines()
+        for line in file_lines:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                normalized = normalize_video_input(line)
+                blacklist.add(normalized)
+
+    return blacklist
 
 
 def normalize_channel_input(value: str) -> str:
@@ -710,6 +734,19 @@ def limit_records(records: list[VideoRecord], limit: int | None) -> list[VideoRe
     return records[:limit]
 
 
+def filter_blacklisted_records(records: list[VideoRecord], blacklist: set[str]) -> list[VideoRecord]:
+    if not blacklist:
+        return records
+    filtered: list[VideoRecord] = []
+    for record in records:
+        if record.video_id:
+            video_url = f"https://www.youtube.com/watch?v={record.video_id}"
+            if record.video_id in blacklist or video_url in blacklist or record.webpage_url in blacklist:
+                continue
+        filtered.append(record)
+    return filtered
+
+
 def is_valid_video_id(video_id: str) -> bool:
     return bool(VIDEO_ID_PATTERN.fullmatch(video_id))
 
@@ -1096,11 +1133,13 @@ def main() -> int:
     args = parse_args()
     channels = load_channels(args)
     videos = load_videos(args)
+    blacklist = load_blacklist(args)
     download_media = should_download_media(args)
     if not channels and not videos:
-        raise SystemExit(
-            "No inputs provided. Use --channel/--channels-file, --video/--videos-file, or create ./channels.txt or ./manual-videos.txt."
-        )
+        if not (args.youtube_playlist_id and args.youtube_prune_older_than_days):
+            raise SystemExit(
+                "No inputs provided. Use --channel/--channels-file, --video/--videos-file, or create ./channels.txt or ./manual-videos.txt."
+            )
 
     log(
         f"Starting dabbleverse with {len(channels)} channels and {len(videos)} direct videos, "
@@ -1118,6 +1157,8 @@ def main() -> int:
         log(f"Using browser cookies from {args.cookies_from_browser}.")
     elif args.cookies:
         log(f"Using cookies file {args.cookies}.")
+    if blacklist:
+        log(f"Loaded blacklist with {len(blacklist)} entries.")
     log(f"yt-dlp socket timeout is {args.socket_timeout:.1f}s.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1139,7 +1180,10 @@ def main() -> int:
     log(f"Collected {len(all_records)} raw records across all channels.")
     deduped_records = dedupe_records(all_records)
     log(f"Kept {len(deduped_records)} unique records after dedupe.")
-    records = sort_records(deduped_records)
+    blacklist_filtered = filter_blacklisted_records(deduped_records, blacklist)
+    if blacklist and len(blacklist_filtered) < len(deduped_records):
+        log(f"Removed {len(deduped_records) - len(blacklist_filtered)} blacklisted videos.")
+    records = sort_records(blacklist_filtered)
     records = shuffle_records(records, args.shuffle_seed)
     if args.shuffle_seed is not None:
         log(f"Shuffled {len(records)} records with seed {args.shuffle_seed}.")

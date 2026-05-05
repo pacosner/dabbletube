@@ -1,0 +1,10 @@
+# Add video URLs or IDs that you want to exclude from download
+# One video per line
+# You can use:
+#   - Full URLs: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+#   - Video IDs: dQw4w9WgXcQ
+#   - @handle URLs: https://www.youtube.com/@username
+# Lines starting with # are comments and will be ignored
+
+fZn_YNcaCJc
+Uuen3iuHSHk
