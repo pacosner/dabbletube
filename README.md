@@ -201,4 +201,34 @@ Useful Windows commands:
 Get-ScheduledTask -TaskName "Start WSL At Login"
 Start-ScheduledTask -TaskName "Start WSL At Login"
 Unregister-ScheduledTask -TaskName "Start WSL At Login" -Confirm:$false
+
+## Prune old YouTube playlist items
+
+```bash
+./run-prune-old-playlist-task.sh
+```
+
+This prunes playlist items older than the configured retention age from the default playlist using YouTube API mode.
+
+Defaults:
+
+- `--channel-source youtube-api`
+- `PLAYLIST_ID=PLieDuyulq1X7z4ch-V_oGGoVkuZJy8nSQ`
+- `CLIENT_SECRETS=secret.json`
+- `TOKEN_FILE=.secrets/youtube-token.json`
+- `DAYS_TO_KEEP=30`
+
+Dry-run example:
+
+```bash
+./run-prune-old-playlist-task.sh --dry-run
+```
+
+This will report how many playlist items would be kept and how many would be pruned.
+
+Override the default retention age:
+
+```bash
+./run-prune-old-playlist-task.sh --days-to-keep 45
+```
 ```

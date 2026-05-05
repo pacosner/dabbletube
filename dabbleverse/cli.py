@@ -945,10 +945,16 @@ def get_existing_playlist_video_ids(youtube: Any, playlist_id: str) -> set[str]:
     return existing_video_ids
 
 
-def prune_existing_playlist_items(youtube: Any, playlist_id: str, prune_older_than_days: float) -> tuple[int, set[str]]:
+def prune_existing_playlist_items(
+    youtube: Any,
+    playlist_id: str,
+    prune_older_than_days: float,
+    dry_run: bool = False,
+) -> tuple[int, set[str], int]:
     cutoff = datetime.now().astimezone().timestamp() - (prune_older_than_days * 86400)
     remaining_video_ids: set[str] = set()
     removed = 0
+    total_items = 0
     next_page_token: str | None = None
     page = 0
 
@@ -968,26 +974,28 @@ def prune_existing_playlist_items(youtube: Any, playlist_id: str, prune_older_th
 
         items = response.get("items", [])
         for item in items:
+            total_items += 1
             snippet = item.get("snippet", {})
             playlist_item_id = item.get("id")
             video_id = snippet.get("resourceId", {}).get("videoId")
             added_at = parse_api_datetime(snippet.get("publishedAt"))
             should_prune = bool(playlist_item_id and added_at and added_at.timestamp() < cutoff)
             if should_prune:
-                youtube.playlistItems().delete(id=playlist_item_id).execute()
+                if not dry_run:
+                    youtube.playlistItems().delete(id=playlist_item_id).execute()
                 removed += 1
                 continue
             if video_id:
                 remaining_video_ids.add(video_id)
 
-        if removed and (removed % 25 == 0):
+        if removed and (removed % 25 == 0) and not dry_run:
             log(f"Pruned {removed} existing playlist items so far...")
 
         next_page_token = response.get("nextPageToken")
         if not next_page_token:
             break
 
-    return removed, remaining_video_ids
+    return removed, remaining_video_ids, total_items
 
 
 def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]) -> dict[str, Any]:
@@ -1017,14 +1025,24 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
                     f"Pruning playlist items older than {args.youtube_prune_older_than_days:g} days from {playlist_id}...",
                     flush=True,
                 )
-                pruned_item_count, existing_video_ids = prune_existing_playlist_items(
-                    youtube, playlist_id, args.youtube_prune_older_than_days
+                pruned_item_count, existing_video_ids, total_playlist_items = prune_existing_playlist_items(
+                    youtube,
+                    playlist_id,
+                    args.youtube_prune_older_than_days,
+                    dry_run=args.dry_run,
                 )
-                print(
-                    f"Pruned {pruned_item_count} playlist items older than "
-                    f"{args.youtube_prune_older_than_days:g} days.",
-                    flush=True,
-                )
+                if args.dry_run:
+                    print(
+                        f"Dry run: would prune {pruned_item_count} of {total_playlist_items} playlist items "
+                        f"and keep {len(existing_video_ids)} known videos.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"Pruned {pruned_item_count} playlist items older than "
+                        f"{args.youtube_prune_older_than_days:g} days.",
+                        flush=True,
+                    )
             else:
                 print(f"Loading existing items from playlist {playlist_id}...", flush=True)
                 existing_video_ids = get_existing_playlist_video_ids(youtube, playlist_id)
@@ -1119,6 +1137,7 @@ def create_youtube_playlist(args: argparse.Namespace, records: list[VideoRecord]
         "youtube_replaced_existing_playlist": replaced_existing,
         "youtube_removed_existing_item_count": removed_item_count,
         "youtube_pruned_item_count": pruned_item_count,
+        "youtube_playlist_items_remaining_count": len(existing_video_ids),
         "youtube_already_present_video_count": len(already_present_video_ids),
         "youtube_already_present_video_ids": already_present_video_ids,
         "youtube_video_count": len(added_video_ids),
@@ -1192,7 +1211,9 @@ def main() -> int:
     playlist_path = args.output_dir / f"{args.playlist_name}.m3u"
 
     youtube_result: dict[str, Any] | None = None
-    if (args.youtube_create_playlist or args.youtube_playlist_id) and not args.dry_run:
+    if (args.youtube_create_playlist or args.youtube_playlist_id) and (
+        not args.dry_run or (args.youtube_playlist_id and args.youtube_prune_older_than_days)
+    ):
         try:
             youtube_result = create_youtube_playlist(args, records)
         except Exception as exc:
@@ -1222,6 +1243,13 @@ def main() -> int:
         if youtube_result["youtube_already_present_video_count"]:
             print(
                 f"Skipped {youtube_result['youtube_already_present_video_count']} videos already in the playlist.",
+                flush=True,
+            )
+        if args.youtube_prune_older_than_days and args.dry_run:
+            kept_count = youtube_result.get("youtube_playlist_items_remaining_count", 0)
+            pruned_count = youtube_result.get("youtube_pruned_item_count", 0)
+            print(
+                f"Dry run summary: would keep {kept_count} videos and prune {pruned_count} videos.",
                 flush=True,
             )
     elif (args.youtube_create_playlist or args.youtube_playlist_id) and args.dry_run:
